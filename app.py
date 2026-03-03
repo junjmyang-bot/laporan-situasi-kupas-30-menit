@@ -6,6 +6,7 @@ from html import escape
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib import parse, request
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -59,7 +60,7 @@ TELEGRAM_SOFT_LIMIT = 3200
 
 
 def now_local() -> datetime:
-    return datetime.now().astimezone()
+    return datetime.now(ZoneInfo("Asia/Jakarta"))
 
 
 def now_iso() -> str:
