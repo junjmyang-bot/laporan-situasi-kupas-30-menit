@@ -650,6 +650,9 @@ def validate(payload: dict) -> list[str]:
 def _telegram_head_lines(payload: dict) -> list[str]:
     team_label = TEAM_LABELS.get(payload["team_id"], payload["team_id"])
     return [
+        f"*{team_label.upper()} - SHIFT {str(payload['shift']).upper()}*",
+        f"*PELAPOR: {pretty_label(payload['reporter']).upper()}*",
+        "",
         "B-1-2 LAPORAN SITUASI KUPAS (30 MENIT)",
         "",
         "*1) Header*",
@@ -1300,13 +1303,6 @@ def main() -> None:
         if expected != current_total and (move_in_raw.strip() or move_out_raw.strip()):
             st.warning("Mutasi masuk/keluar belum cocok dengan perubahan total.")
 
-    event_slot = st.text_area(
-        "Event slot ini (opsional)",
-        height=80,
-        placeholder="Contoh: 1 orang izin pulang sebentar: Mike / Shift tengah datang 3 pax.",
-        key="event_slot",
-    )
-
     col_r1, col_r2 = st.columns(2)
     with col_r1:
         change_reason = st.text_area(
@@ -1321,6 +1317,13 @@ def main() -> None:
             placeholder="sudah cek",
             key="tl_confirm",
         )
+
+    event_slot = st.text_area(
+        "Event slot ini (opsional)",
+        height=80,
+        placeholder="Contoh: 1 orang izin pulang sebentar: Mike / Shift tengah datang 3 pax.",
+        key="event_slot",
+    )
 
     payload = {
         "work_date": work_date,
@@ -1438,6 +1441,7 @@ def main() -> None:
                 st.session_state.telegram_root_message_id = message_id_new
                 st.warning("Pesan lama tidak bisa di-edit. Dikirim sebagai pesan baru.")
                 st.success(f"{msg_new} (message_id={message_id_new})")
+                persist_state_to_disk()
                 row = build_sheet_row(payload, current_total)
                 sheet_state, msg_sheet = append_sheet_backup(payload, row)
                 if sheet_state == "ok":
@@ -1446,7 +1450,6 @@ def main() -> None:
                     st.warning(msg_sheet)
                 else:
                     st.caption(msg_sheet)
-                st.json({"row": row})
                 st.caption(f"Idempotency Key: {payload['idempotency_key']}")
                 return
             ok_reply, msg_reply = send_update_reply(root_message_id)
@@ -1474,7 +1477,6 @@ def main() -> None:
             st.warning(msg_sheet)
         else:
             st.caption(msg_sheet)
-        st.json({"row": row})
         st.caption(f"Idempotency Key: {payload['idempotency_key']}")
 
     if st.button("Simpan draft lokal"):
