@@ -5,7 +5,7 @@ import uuid
 from html import escape
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib import parse, request
+from urllib import error as urlerror, parse, request
 from zoneinfo import ZoneInfo
 
 import streamlit as st
@@ -791,6 +791,14 @@ def _telegram_api(method: str, payload: dict) -> tuple[bool, str, dict]:
             if parsed.get("ok"):
                 return True, "OK", parsed.get("result", {})
             return False, f"Telegram 응답 오류: {parsed}", {}
+    except urlerror.HTTPError as err:
+        try:
+            body = err.read().decode("utf-8", errors="ignore")
+            parsed = json.loads(body)
+            desc = parsed.get("description") or body
+            return False, f"Telegram API HTTP {err.code}: {desc}", {}
+        except Exception:
+            return False, f"Telegram API HTTP {err.code}", {}
     except Exception as err:
         return False, f"Telegram API 실패: {err}", {}
 
@@ -1433,25 +1441,32 @@ def main() -> None:
         if root_message_id and len(preview_parts) == 1:
             ok, msg = edit_existing_message(root_message_id, preview_text)
             if not ok:
-                # Fallback: if edit target is gone/uneditable, send as a new message and relink root.
-                ok_new, msg_new, message_id_new = send_new_message(preview_text)
-                if not ok_new:
+                m = msg.lower()
+                if "message is not modified" in m:
+                    st.info("Konten sama dengan pesan sebelumnya. Tidak ada edit baru.")
+                elif ("message to edit not found" in m) or ("can't be edited" in m) or ("message can't be edited" in m):
+                    # Fallback: if edit target is gone/uneditable, send as a new message and relink root.
+                    ok_new, msg_new, message_id_new = send_new_message(preview_text)
+                    if not ok_new:
+                        st.error(msg)
+                        return
+                    st.session_state.telegram_root_message_id = message_id_new
+                    st.warning("Pesan lama tidak bisa di-edit. Dikirim sebagai pesan baru.")
+                    st.success(f"{msg_new} (message_id={message_id_new})")
+                    persist_state_to_disk()
+                    row = build_sheet_row(payload, current_total)
+                    sheet_state, msg_sheet = append_sheet_backup(payload, row)
+                    if sheet_state == "ok":
+                        st.caption("Sheets backup: OK")
+                    elif sheet_state == "error":
+                        st.warning(msg_sheet)
+                    else:
+                        st.caption(msg_sheet)
+                    st.caption(f"Idempotency Key: {payload['idempotency_key']}")
+                    return
+                else:
                     st.error(msg)
                     return
-                st.session_state.telegram_root_message_id = message_id_new
-                st.warning("Pesan lama tidak bisa di-edit. Dikirim sebagai pesan baru.")
-                st.success(f"{msg_new} (message_id={message_id_new})")
-                persist_state_to_disk()
-                row = build_sheet_row(payload, current_total)
-                sheet_state, msg_sheet = append_sheet_backup(payload, row)
-                if sheet_state == "ok":
-                    st.caption("Sheets backup: OK")
-                elif sheet_state == "error":
-                    st.warning(msg_sheet)
-                else:
-                    st.caption(msg_sheet)
-                st.caption(f"Idempotency Key: {payload['idempotency_key']}")
-                return
             ok_reply, msg_reply = send_update_reply(root_message_id)
             if not ok_reply:
                 st.warning(f"Pesan terupdate, tapi reply gagal: {msg_reply}")
