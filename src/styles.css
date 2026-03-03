@@ -1,0 +1,147 @@
+:root {
+  --bg: #f7f7f2;
+  --surface: #ffffff;
+  --text: #1f2937;
+  --muted: #6b7280;
+  --accent: #0f766e;
+  --accent-strong: #115e59;
+  --danger: #b91c1c;
+  --radius: 12px;
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+  color: var(--text);
+  background: linear-gradient(180deg, #f7f7f2 0%, #eceee8 100%);
+}
+
+.app {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 16px 14px 24px;
+}
+
+.card {
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 14px;
+  box-shadow: var(--shadow);
+  margin-bottom: 12px;
+}
+
+.title {
+  margin: 0 0 8px;
+  font-size: 1.05rem;
+}
+
+.subtitle {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.section-title {
+  margin: 0 0 10px;
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.field {
+  margin-bottom: 10px;
+}
+
+.field.inline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.label {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.input,
+.select,
+.textarea {
+  width: 100%;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  padding: 12px;
+  font-size: 1rem;
+  background: #fff;
+}
+
+.textarea {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.readonly {
+  background: #f3f4f6;
+  color: #374151;
+}
+
+.status {
+  min-height: 20px;
+  font-size: 0.9rem;
+}
+
+.status.error {
+  color: var(--danger);
+}
+
+.status.ok {
+  color: var(--accent-strong);
+}
+
+.btn {
+  width: 100%;
+  min-height: 48px;
+  border: none;
+  border-radius: 12px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.btn:disabled {
+  opacity: 0.6;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr 86px 86px;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.row-5 {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.mini-btn {
+  width: 100%;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  min-height: 40px;
+  background: #fff;
+  font-size: 0.92rem;
+}
