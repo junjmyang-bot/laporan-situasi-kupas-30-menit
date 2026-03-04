@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import secrets
 import threading
 import uuid
 from html import escape
@@ -263,9 +264,9 @@ def persist_state_to_disk() -> None:
     try:
         expected = st.session_state.get("scope_version")
         ok, new_version = save_scoped_state(work_date, team_id, build_persist_payload(), expected_version=expected)
-        st.session_state["scope_version"] = new_version
         if not ok:
             return
+        st.session_state["scope_version"] = new_version
     except Exception as e:
         st.warning("Penyimpanan lokal gagal: " + str(e))
 
@@ -536,7 +537,7 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
 
     lines: list[str] = [
         f"3-{slot_idx}) {report_time}",
-        f"   Total waktu laporan: {slot_item['slot_total']} pax",
+        f"   Total waktu laporan: {int(slot_item.get('slot_total', 0))} pax",
         f"   Sumber: {sumber_line}",
     ]
 
@@ -568,7 +569,7 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
             lines.append(f"   Konfirmasi TL: {tl_confirm}")
 
     lines.append("")
-    lines.extend(format_grouped_activities(slot_item["activities"], slot_item.get("group_pic", {})))
+    lines.extend(format_grouped_activities(slot_item.get("activities", []), slot_item.get("group_pic", {})))
 
     event_lines = split_note_lines(slot_item.get("event_slot", ""))
     if event_lines and (event_lines != reason_lines):
@@ -576,7 +577,7 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
         for extra in event_lines[1:]:
             lines.append(f"                 - {extra}")
 
-    lines.append(f"   Total semua aktivitas pada waktu laporan ini: {slot_item['slot_total']} pax")
+    lines.append(f"   Total semua aktivitas pada waktu laporan ini: {int(slot_item.get('slot_total', 0))} pax")
     return lines
 
 
@@ -846,18 +847,13 @@ def _telegram_api(method: str, payload: dict) -> tuple[bool, str, dict]:
         return False, f"Galat API Telegram: {err}", {}
 
 
-def _escape_mdv2(text: str) -> str:
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
-
-
 def send_new_message(message: str) -> tuple[bool, str, int | None]:
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
         return False, "Variabel lingkungan TELEGRAM_CHAT_ID belum diatur.", None
-    message = _escape_mdv2(message)
     ok, msg, data = _telegram_api(
         "sendMessage",
-        {"chat_id": chat_id, "text": message, "parse_mode": "MarkdownV2"},
+        {"chat_id": chat_id, "text": message},
     )
     if not ok:
         return False, msg, None
@@ -868,10 +864,9 @@ def edit_existing_message(message_id: int, message: str) -> tuple[bool, str]:
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
         return False, "Variabel lingkungan TELEGRAM_CHAT_ID belum diatur."
-    message = _escape_mdv2(message)
     ok, msg, _ = _telegram_api(
         "editMessageText",
-        {"chat_id": chat_id, "message_id": message_id, "text": message, "parse_mode": "MarkdownV2"},
+        {"chat_id": chat_id, "message_id": message_id, "text": message},
     )
     if not ok:
         return False, msg
@@ -941,24 +936,36 @@ def main() -> None:
     st.markdown(
         """
         <style>
+        :root {
+          --txt-main: #1f2937;
+          --txt-muted: #4a5568;
+        }
+        @media (prefers-color-scheme: dark) {
+          :root {
+            --txt-main: #e5e7eb;
+            --txt-muted: #cbd5e1;
+          }
+        }
         h1 {
           font-size: 2rem !important;
           font-weight: 700 !important;
           line-height: 1.2 !important;
+          color: var(--txt-main) !important;
         }
         h2, h3 {
           font-size: 1.35rem !important;
           font-weight: 650 !important;
           line-height: 1.25 !important;
+          color: var(--txt-main) !important;
         }
         div[data-testid="stCaptionContainer"] p {
           font-size: 1rem !important;
-          color: #4a5568 !important;
+          color: var(--txt-muted) !important;
           line-height: 1.45 !important;
         }
         .stMarkdown p, label {
           font-size: 1rem !important;
-          color: #1f2937 !important;
+          color: var(--txt-main) !important;
         }
         .stButton > button {
           padding: 0.15rem 0.5rem;
@@ -1013,7 +1020,7 @@ def main() -> None:
     if open_clicked:
         if not operator_name.strip():
             st.error("Nama operator wajib diisi.")
-        elif team_pin == TEAM_PASSWORDS.get(team_id, ""):
+        elif secrets.compare_digest(team_pin, TEAM_PASSWORDS.get(team_id, "")):
             ok_lock, msg_lock = acquire_scope_lock(work_date, team_id, operator_name, force=False)
             if ok_lock:
                 st.session_state["authenticated_scope"] = scope
@@ -1029,7 +1036,7 @@ def main() -> None:
     if takeover_clicked:
         if not operator_name.strip():
             st.error("Nama operator wajib diisi.")
-        elif team_pin == TEAM_PASSWORDS.get(team_id, ""):
+        elif secrets.compare_digest(team_pin, TEAM_PASSWORDS.get(team_id, "")):
             ok_take, msg_take = acquire_scope_lock(work_date, team_id, operator_name, force=True)
             if ok_take:
                 st.session_state["authenticated_scope"] = scope
@@ -1110,7 +1117,7 @@ def main() -> None:
         with col_f:
             checker_packing = st.text_input("Pemeriksa silang packing", placeholder="Nama petugas", key="checker_packing")
 
-    st.subheader("2) Detail Aktivitas + Keterangan")
+    st.subheader("2) Detail Kerjaan")
     st.caption(f"Waktu laporan aktif: {report_slot}")
     # Do not auto-reset form values when clock slot changes.
     # Auto reset caused unexpected "0" totals during edit/resubmit flows.
@@ -1141,7 +1148,7 @@ def main() -> None:
     if "manual_groups" not in st.session_state:
         st.session_state["manual_groups"] = []
 
-    st.markdown("**Pilih blok aktivitas**")
+    st.markdown("**2-1) Pilih blok aktivitas**")
     g1, g2 = st.columns([8, 2])
     with g1:
         new_group_name = st.text_input(
@@ -1153,7 +1160,10 @@ def main() -> None:
     with g2:
         if st.button("Tambah blok", type="secondary"):
             name = (new_group_name or "").strip()
-            if name and name not in st.session_state["manual_groups"]:
+            exists_slug = any(slug(name) == slug(existing) for existing in st.session_state.get("manual_groups", []))
+            if exists_slug:
+                st.warning("Nama blok bentrok. Gunakan nama lain yang lebih spesifik.")
+            elif name and name not in st.session_state["manual_groups"]:
                 st.session_state["manual_groups"].append(name)
                 st.rerun()
 
@@ -1400,7 +1410,7 @@ def main() -> None:
     if source_sum_now != int(current_total_people):
         st.error("Total komposisi sumber tidak sama dengan Total orang per saat ini.")
 
-    st.markdown("**Analisis Perubahan Total (untuk TL)**")
+    st.markdown("**2-2) Analisis Perubahan Total (untuk TL)**")
     prev_text = "Belum ada" if prev is None else f"{prev} pax"
     st.caption(f"Total waktu laporan sebelumnya: {prev_text} | Selisih sekarang: {delta_text}")
     if isinstance(prev, int) and current_total != prev:
@@ -1437,7 +1447,7 @@ def main() -> None:
             key="tl_confirm",
         )
 
-    st.markdown("**Keterangan**")
+    st.markdown("**3) Keterangan**")
     event_slot = st.text_area(
         "Keterangan tambahan (opsional)",
         height=120,
@@ -1543,16 +1553,14 @@ def main() -> None:
             session_ver = st.session_state.get("scope_version")
             if session_ver is not None and live_version != int(session_ver):
                 st.session_state["scope_version"] = live_version
+                st.error("Data berubah dari sesi lain. Muat ulang halaman lalu cek kembali sebelum kirim.")
+                return
     
             errors = validate(payload)
             if errors:
-                st.error(errors[0])
+                for err in errors:
+                    st.error(err)
                 return
-    
-            st.session_state.submission_id = payload["idempotency_key"]
-            st.session_state.previous_total = current_total
-            st.session_state.slot_history = active_part["history"]
-            persist_state_to_disk()
     
             root_message_id = st.session_state.telegram_root_message_id
             if root_message_id and len(preview_parts) == 1:
@@ -1570,17 +1578,6 @@ def main() -> None:
                         st.session_state.telegram_root_message_id = message_id_new
                         st.warning("Pesan lama tidak bisa diperbarui. Dikirim sebagai pesan baru.")
                         st.success(f"{msg_new} (ID pesan={message_id_new})")
-                        persist_state_to_disk()
-                        row = build_sheet_row(payload, current_total)
-                        sheet_state, msg_sheet = append_sheet_backup(payload, row)
-                        if sheet_state == "ok":
-                            st.caption("Cadangan Sheets: berhasil")
-                        elif sheet_state == "error":
-                            st.warning(msg_sheet)
-                        else:
-                            st.caption(msg_sheet)
-                        st.caption(f"Kunci idempoten: {payload['idempotency_key']}")
-                        return
                     else:
                         st.error(msg)
                         return
@@ -1600,7 +1597,12 @@ def main() -> None:
                         f"(bagian {active_part['part_no']})."
                     )
                 st.success(f"{msg} (ID pesan={message_id})")
-    
+
+            st.session_state.submission_id = payload["idempotency_key"]
+            st.session_state.previous_total = current_total
+            st.session_state.slot_history = preview_history
+            persist_state_to_disk()
+
             row = build_sheet_row(payload, current_total)
             sheet_state, msg_sheet = append_sheet_backup(payload, row)
             if sheet_state == "ok":
