@@ -4,6 +4,7 @@ import re
 import secrets
 import threading
 import uuid
+from difflib import SequenceMatcher
 from html import escape
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -125,6 +126,136 @@ def split_note_lines(text: str) -> list[str]:
     return parts
 
 
+def _is_pic_task(task: str) -> bool:
+    return str(task or "").strip().upper().startswith("PIC LAPORAN")
+
+
+def normalize_person_name(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").strip().lower())
+
+
+def person_pair_key(name_a: str, name_b: str) -> str:
+    a = normalize_person_name(name_a)
+    b = normalize_person_name(name_b)
+    if not a or not b or a == b:
+        return ""
+    first, second = sorted([a, b])
+    return f"{first}|{second}"
+
+
+def _looks_like_same_person(name_a: str, name_b: str) -> bool:
+    a = str(name_a or "").strip()
+    b = str(name_b or "").strip()
+    if not a or not b:
+        return False
+    na = normalize_person_name(a)
+    nb = normalize_person_name(b)
+    if not na or not nb or na == nb:
+        return False
+    if len(na) >= 4 and len(nb) >= 4 and (na in nb or nb in na):
+        return True
+    return SequenceMatcher(None, na, nb).ratio() >= 0.86
+
+
+def detect_pic_identity_candidates(group_pic_map: dict[str, dict]) -> list[dict]:
+    by_norm: dict[str, str] = {}
+    for _group, pic in (group_pic_map or {}).items():
+        if not isinstance(pic, dict):
+            continue
+        name = str(pic.get("name", "")).strip()
+        norm = normalize_person_name(name)
+        if norm and norm not in by_norm:
+            by_norm[norm] = name
+
+    values = list(by_norm.values())
+    out: list[dict] = []
+    for i in range(len(values)):
+        for j in range(i + 1, len(values)):
+            a = values[i]
+            b = values[j]
+            if not _looks_like_same_person(a, b):
+                continue
+            key = person_pair_key(a, b)
+            if not key:
+                continue
+            out.append({"key": key, "name_a": a, "name_b": b})
+    return out
+
+
+def _build_pic_name_roots(names: list[str], identity_overrides: dict[str, str]) -> dict[str, str]:
+    norms = [normalize_person_name(x) for x in names if normalize_person_name(x)]
+    parent: dict[str, str] = {n: n for n in norms}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for raw_key, decision in (identity_overrides or {}).items():
+        if decision != "sama":
+            continue
+        if "|" not in str(raw_key):
+            continue
+        left, right = str(raw_key).split("|", 1)
+        if left in parent and right in parent:
+            union(left, right)
+
+    return {n: find(n) for n in norms}
+
+
+def collect_pic_overlap_context(
+    rows: list[dict],
+    group_pic_map: dict[str, dict],
+    identity_overrides: dict[str, str] | None = None,
+) -> dict:
+    identity_overrides = identity_overrides or {}
+    group_pic_name: dict[str, str] = {}
+    for group, pic in (group_pic_map or {}).items():
+        if isinstance(pic, dict):
+            group_pic_name[group] = str(pic.get("name", "")).strip()
+
+    roots = _build_pic_name_roots(list(group_pic_name.values()), identity_overrides)
+    person_groups: dict[str, list[str]] = {}
+    for group, raw_name in group_pic_name.items():
+        norm = normalize_person_name(raw_name)
+        if not norm:
+            continue
+        root = roots.get(norm, norm)
+        person_groups.setdefault(root, []).append(group)
+
+    group_pic_totals: dict[str, int] = {}
+    for row in rows:
+        group = str(row.get("group", ""))
+        if not _is_pic_task(str(row.get("task", ""))):
+            continue
+        subtotal = sum(int(row.get(k, 0)) for k in COUNT_KEYS)
+        group_pic_totals[group] = subtotal
+
+    notes: dict[str, str] = {}
+    conflicts: list[str] = []
+    for _person, groups in person_groups.items():
+        if len(groups) < 2:
+            continue
+        counted = [g for g in groups if int(group_pic_totals.get(g, 0)) > 0]
+        if len(counted) > 1:
+            conflicts.append(", ".join(pretty_label(g) for g in counted))
+        counted_ref = counted[0] if counted else groups[0]
+        for group in groups:
+            if group == counted_ref:
+                continue
+            if int(group_pic_totals.get(group, 0)) == 0:
+                notes[group] = f"PIC merangkap di blok {pretty_label(counted_ref)}, tidak dihitung ganda"
+
+    return {"notes": notes, "conflicts": conflicts}
+
+
 def pretty_label(text: str) -> str:
     s = str(text or "").strip()
     if not s:
@@ -230,6 +361,7 @@ def build_persist_payload() -> dict:
         "submission_id",
         "telegram_root_message_id",
         "slot_history",
+        "pic_identity_overrides",
         "qc_name",
         "tl_name",
         "operator_name",
@@ -371,6 +503,8 @@ def init_state() -> None:
         st.session_state.telegram_root_message_id = None
     if "slot_history" not in st.session_state:
         st.session_state.slot_history = []
+    if "pic_identity_overrides" not in st.session_state or not isinstance(st.session_state.get("pic_identity_overrides"), dict):
+        st.session_state["pic_identity_overrides"] = {}
     if "manual_groups" not in st.session_state:
         st.session_state["manual_groups"] = []
     if "confirm_remove_group" not in st.session_state:
@@ -489,7 +623,11 @@ def format_activity_line(row: dict) -> str:
     return "+".join(parts) if parts else "0"
 
 
-def format_grouped_activities(rows: list[dict], group_pic_map: dict[str, dict] | None = None) -> list[str]:
+def format_grouped_activities(
+    rows: list[dict],
+    group_pic_map: dict[str, dict] | None = None,
+    pic_overlap_notes: dict[str, str] | None = None,
+) -> list[str]:
     grouped: dict[str, list[dict]] = {}
     order = list(ACTIVITY_GROUP_TEMPLATES.keys())
     for row in rows:
@@ -510,8 +648,17 @@ def format_grouped_activities(rows: list[dict], group_pic_map: dict[str, dict] |
         lines.append(f"- {pretty_label(group)}{pic_line}")
         group_total = 0
         for row in grouped[group]:
-            lines.append(f"  - {pretty_label(row['task'])}: {format_activity_line(row)}")
-            group_total += sum(int(row.get(k, 0)) for k in COUNT_KEYS)
+            subtotal = sum(int(row.get(k, 0)) for k in COUNT_KEYS)
+            line = f"  - {pretty_label(row['task'])}: {format_activity_line(row)}"
+            if (
+                subtotal == 0
+                and _is_pic_task(str(row.get("task", "")))
+                and isinstance(pic_overlap_notes, dict)
+                and group in pic_overlap_notes
+            ):
+                line += f" ({pic_overlap_notes[group]})"
+            lines.append(line)
+            group_total += subtotal
         lines.append(f"  = Total {pretty_label(group)}: {group_total} pax")
         lines.append("")
     if lines and lines[-1] == "":
@@ -569,7 +716,13 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
             lines.append(f"   Konfirmasi TL: {tl_confirm}")
 
     lines.append("")
-    lines.extend(format_grouped_activities(slot_item.get("activities", []), slot_item.get("group_pic", {})))
+    lines.extend(
+        format_grouped_activities(
+            slot_item.get("activities", []),
+            slot_item.get("group_pic", {}),
+            slot_item.get("pic_overlap_notes", {}),
+        )
+    )
 
     event_lines = split_note_lines(slot_item.get("event_slot", ""))
     if event_lines and (event_lines != reason_lines):
@@ -664,8 +817,11 @@ def validate(payload: dict) -> list[str]:
 
     rows = payload.get("activities", [])
     parse_errors = payload.get("activity_parse_errors", [])
+    pic_conflicts = payload.get("pic_multi_count_conflicts", [])
     if parse_errors:
         errors.append(parse_errors[0])
+    if pic_conflicts:
+        errors.append("PIC yang sama terhitung di lebih dari satu blok: " + pic_conflicts[0])
     if not rows:
         errors.append("Pilih minimal 1 aktivitas.")
     else:
@@ -693,14 +849,19 @@ def validate(payload: dict) -> list[str]:
 
 def _telegram_head_lines(payload: dict) -> list[str]:
     team_label = TEAM_LABELS.get(payload["team_id"], payload["team_id"])
+    reporter_upper = pretty_label(payload["reporter"]).upper()
+    shift_upper = str(payload["shift"]).upper()
     return [
-        f"*{team_label.upper()} - SHIFT {str(payload['shift']).upper()}*",
-        f"*PELAPOR: {pretty_label(payload['reporter']).upper()}*",
+        "*B-1-2 LAPORAN SITUASI KUPAS (30 MENIT)*",
+        f"*PETUGAS LAPORAN: {reporter_upper}*",
+        f"*SHIFT: {shift_upper} | TIM: {team_label.upper()}*",
         "",
-        "B-1-2 LAPORAN SITUASI KUPAS (30 MENIT)",
+        "================================",
         "",
-        "*1) Header*",
-        f"- Tim laporan: {team_label} (Shift {payload['shift']})",
+        "*Ringkasan Header*",
+        "",
+        f"- Tim laporan: {team_label}",
+        f"- Shift: {payload['shift']}",
         f"- Tanggal kerja: {payload['work_date']}",
         f"- QC: {pretty_label(payload['qc_name'])}",
         f"- TL: {pretty_label(payload['tl_name'])}",
@@ -1369,7 +1530,34 @@ def main() -> None:
                     st.session_state[table_key] = [x[2] for x in ranked]
                 st.rerun()
 
+    pic_identity_overrides = st.session_state.get("pic_identity_overrides", {})
+    if not isinstance(pic_identity_overrides, dict):
+        pic_identity_overrides = {}
+    pic_candidates = detect_pic_identity_candidates(group_pic_map)
+    if pic_candidates:
+        with st.expander("Konfirmasi nama PIC mirip", expanded=False):
+            st.caption("Untuk menghindari hitung ganda PIC, pastikan apakah nama-nama ini orang yang sama.")
+            for cand in pic_candidates:
+                key = cand["key"]
+                current = str(pic_identity_overrides.get(key, "belum"))
+                options = ["belum", "sama", "berbeda"]
+                labels = {
+                    "belum": "Belum dipastikan",
+                    "sama": "Orang yang sama",
+                    "berbeda": "Orang berbeda",
+                }
+                selected = st.selectbox(
+                    f"{pretty_label(cand['name_a'])} vs {pretty_label(cand['name_b'])}",
+                    options,
+                    index=options.index(current) if current in options else 0,
+                    format_func=lambda x: labels.get(x, x),
+                    key=f"pic_identity_{key}",
+                )
+                pic_identity_overrides[key] = selected
+            st.session_state["pic_identity_overrides"] = pic_identity_overrides
+
     activity_rows, parse_errors = get_activity_rows(group_items_map)
+    pic_overlap_context = collect_pic_overlap_context(activity_rows, group_pic_map, pic_identity_overrides)
     current_total = activity_total(activity_rows)
     prev = st.session_state.previous_total
     delta_text = "Belum ada" if prev is None else f"{current_total - prev:+d}"
@@ -1388,6 +1576,13 @@ def main() -> None:
 
     if activity_rows:
         render_activity_summary_table(activity_rows)
+    if pic_overlap_context.get("notes"):
+        note_items = list(pic_overlap_context.get("notes", {}).items())
+        st.caption("Info PIC merangkap:")
+        for group, note in note_items:
+            st.caption(f"- {pretty_label(group)}: {note}")
+    if pic_overlap_context.get("conflicts"):
+        st.error("PIC sama terhitung di lebih dari satu blok: " + pic_overlap_context["conflicts"][0])
     if parse_errors:
         st.warning(parse_errors[0])
 
@@ -1472,6 +1667,7 @@ def main() -> None:
         "nampan_ubi_officer": nampan_ubi_officer if "nampan_ubi_officer" in locals() else "",
         "activities": activity_rows,
         "activity_parse_errors": parse_errors,
+        "pic_multi_count_conflicts": pic_overlap_context.get("conflicts", []),
         "move_in_total": move_in_total,
         "move_out_total": move_out_total,
         "move_in_raw": move_in_raw,
@@ -1487,6 +1683,7 @@ def main() -> None:
         "report_time": system_time,
         "activities": activity_rows,
         "group_pic": group_pic_map,
+        "pic_overlap_notes": pic_overlap_context.get("notes", {}),
         "slot_total": current_total,
         "source_composition": source_composition,
         "delta_text": delta_text,
