@@ -48,22 +48,35 @@ PERSIST_PATH = Path(".laporan_situasi_state.json")
 STATE_PREFIX_KEYS = ("mix_", "extra_", "src_", "order_", "ord_", "tasks_table_", "task_name_", "pic_name_", "pic_role_", "pic_mode_")
 LOCK_TTL_SECONDS = 600
 STATE_IO_LOCK = threading.RLock()
+TEAM_PASSWORDS_ERROR: str | None = None
 
 
 def _load_team_passwords() -> dict:
+    global TEAM_PASSWORDS_ERROR
+    defaults = {
+        "KUPAS-1": "abcd",
+        "KUPAS-2": "1234",
+        "KUPAS-3": "ab12",
+    }
     raw = os.getenv("TEAM_PASSWORDS", "").strip()
     if not raw:
-        raise RuntimeError(
-            "TEAM_PASSWORDS environment variable belum diatur. "
-            "Isi dengan JSON mapping team->password sebelum app dijalankan."
+        TEAM_PASSWORDS_ERROR = (
+            "TEAM_PASSWORDS belum diatur. Saat ini memakai PIN default sementara. "
+            "Segera set TEAM_PASSWORDS (JSON) di environment."
         )
+        return defaults
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and parsed:
+            TEAM_PASSWORDS_ERROR = None
             return parsed
     except Exception:
         pass
-    raise RuntimeError("TEAM_PASSWORDS tidak valid atau kosong. Gunakan format JSON object.")
+    TEAM_PASSWORDS_ERROR = (
+        "TEAM_PASSWORDS tidak valid. Saat ini memakai PIN default sementara. "
+        "Perbaiki format JSON object di environment."
+    )
+    return defaults
 
 
 TEAM_PASSWORDS = _load_team_passwords()
@@ -923,6 +936,8 @@ def sync_scope_if_needed(work_date: str, team_id: str) -> None:
 def main() -> None:
     init_state()
     st.set_page_config(page_title="Laporan Situasi Kupas", layout="centered")
+    if TEAM_PASSWORDS_ERROR:
+        st.warning(TEAM_PASSWORDS_ERROR)
     st.markdown(
         """
         <style>
