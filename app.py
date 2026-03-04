@@ -520,6 +520,18 @@ def _hhmm_to_minutes(hhmm: str) -> int:
     return int(h) * 60 + int(m)
 
 
+def parse_hhmm_manual(raw: str) -> tuple[str | None, str | None]:
+    text = str(raw or "").strip()
+    if not text:
+        return None, None
+    m = re.fullmatch(r"([01]?\d|2[0-3])[:.]([0-5]\d)", text)
+    if not m:
+        return None, "Format jam harus HH:MM (contoh: 06:30)."
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    return f"{hh:02d}:{mm:02d}", None
+
+
 def build_slots(start_hhmm: str = "00:00", end_hhmm: str = "23:30") -> list[str]:
     start = _hhmm_to_minutes(start_hhmm)
     end = _hhmm_to_minutes(end_hhmm)
@@ -776,6 +788,38 @@ def render_activity_summary_table(rows: list[dict]) -> None:
     </table>
     """
     st.markdown(table_html, unsafe_allow_html=True)
+
+
+def render_live_issues(issues: list[str]) -> None:
+    uniq = [x for x in dict.fromkeys(str(i).strip() for i in issues if str(i).strip())]
+    if not uniq:
+        return
+    html_items = "".join(f"<li>{escape(msg)}</li>" for msg in uniq)
+    html = f"""
+    <style>
+      .issue-panel {{
+        border: 1px solid #ef4444;
+        background: #fff1f2;
+        color: #7f1d1d;
+        border-radius: 10px;
+        padding: 10px 14px;
+        margin: 8px 0 14px 0;
+      }}
+      .issue-panel h4 {{
+        margin: 0 0 6px 0;
+        font-size: 1rem;
+      }}
+      .issue-panel ul {{
+        margin: 0;
+        padding-left: 18px;
+      }}
+    </style>
+    <div class="issue-panel">
+      <h4>Perlu dicek (highlight masalah)</h4>
+      <ul>{html_items}</ul>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def upsert_slot_history(history: list[dict], slot_item: dict) -> list[dict]:
@@ -1217,6 +1261,7 @@ def main() -> None:
     sync_scope_if_needed(work_date, team_id)
     refresh_scope_lock(work_date, team_id)
 
+    live_issues: list[str] = []
     system_time = now_iso()
     shift_defaults = {
         "1": ("06:30", "14:30"),
@@ -1236,14 +1281,35 @@ def main() -> None:
             value=datetime.strptime(default_start, "%H:%M").time(),
             key="work_start_time",
         )
+        st.text_input(
+            "Ketik langsung jam mulai (HH:MM)",
+            key="work_start_manual",
+            placeholder="contoh: 15:00",
+        )
     with col_t3:
         work_end = st.time_input(
             "Jam kerja selesai",
             value=datetime.strptime(default_end, "%H:%M").time(),
             key="work_end_time",
         )
+        st.text_input(
+            "Ketik langsung jam selesai (HH:MM)",
+            key="work_end_manual",
+            placeholder="contoh: 23:30",
+        )
+
     slot_start = f"{work_start.hour:02d}:{work_start.minute:02d}"
     slot_end = f"{work_end.hour:02d}:{work_end.minute:02d}"
+    start_manual, start_err = parse_hhmm_manual(st.session_state.get("work_start_manual", ""))
+    end_manual, end_err = parse_hhmm_manual(st.session_state.get("work_end_manual", ""))
+    if start_err:
+        live_issues.append(f"Jam kerja mulai: {start_err}")
+    if end_err:
+        live_issues.append(f"Jam kerja selesai: {end_err}")
+    if start_manual:
+        slot_start = start_manual
+    if end_manual:
+        slot_end = end_manual
     slots = build_slots(slot_start, slot_end)
     suggested_slot = current_slot()
     if suggested_slot not in slots:
@@ -1251,6 +1317,19 @@ def main() -> None:
     report_slot = suggested_slot
     with col_t3:
         st.text_input("Waktu laporan otomatis (30 menit)", value=report_slot, disabled=True)
+        st.text_input(
+            "Ketik langsung waktu laporan (HH:MM)",
+            key="report_slot_manual",
+            placeholder="contoh: 15:30",
+        )
+    manual_report_slot, report_slot_err = parse_hhmm_manual(st.session_state.get("report_slot_manual", ""))
+    if report_slot_err:
+        live_issues.append(f"Waktu laporan: {report_slot_err}")
+    elif manual_report_slot:
+        if manual_report_slot in slots:
+            report_slot = manual_report_slot
+        else:
+            live_issues.append(f"Waktu laporan {manual_report_slot} di luar rentang jam kerja ({slot_start}-{slot_end}).")
 
     st.subheader("1) Data Header")
     col_a, col_b = st.columns(2)
@@ -1582,9 +1661,12 @@ def main() -> None:
         for group, note in note_items:
             st.caption(f"- {pretty_label(group)}: {note}")
     if pic_overlap_context.get("conflicts"):
-        st.error("PIC sama terhitung di lebih dari satu blok: " + pic_overlap_context["conflicts"][0])
+        msg_pic = "PIC sama terhitung di lebih dari satu blok: " + pic_overlap_context["conflicts"][0]
+        st.error(msg_pic)
+        live_issues.append(msg_pic)
     if parse_errors:
         st.warning(parse_errors[0])
+        live_issues.append(parse_errors[0])
 
     col_sum1, col_sum2 = st.columns(2)
     with col_sum1:
@@ -1601,9 +1683,13 @@ def main() -> None:
             st.caption(f"Komposisi sumber tidak cocok (selisih {source_sum_now - int(current_total_people):+d})")
 
     if int(current_total_people) != current_total:
-        st.error("Total orang per saat ini tidak sama dengan subtotal aktivitas.")
+        msg_total = "Total orang per saat ini tidak sama dengan subtotal aktivitas."
+        st.error(msg_total)
+        live_issues.append(msg_total)
     if source_sum_now != int(current_total_people):
-        st.error("Total komposisi sumber tidak sama dengan Total orang per saat ini.")
+        msg_source = "Total komposisi sumber tidak sama dengan Total orang per saat ini."
+        st.error(msg_source)
+        live_issues.append(msg_source)
 
     st.markdown("**2-2) Analisis Perubahan Total (untuk TL)**")
     prev_text = "Belum ada" if prev is None else f"{prev} pax"
@@ -1618,14 +1704,19 @@ def main() -> None:
     move_out_total = sum(move_out_counts.values())
     if move_in_err:
         st.warning(f"Mutasi masuk: {move_in_err}")
+        live_issues.append(f"Mutasi masuk: {move_in_err}")
     if move_out_err:
         st.warning(f"Mutasi keluar: {move_out_err}")
+        live_issues.append(f"Mutasi keluar: {move_out_err}")
 
     if isinstance(prev, int):
         expected = prev + move_in_total - move_out_total
         st.caption(f"Rekonsiliasi: {prev} + {move_in_total} - {move_out_total} = {expected} (subtotal sekarang {current_total})")
         if expected != current_total and (move_in_raw.strip() or move_out_raw.strip()):
             st.warning("Mutasi masuk/keluar belum cocok dengan perubahan total.")
+            live_issues.append("Mutasi masuk/keluar belum cocok dengan perubahan total.")
+
+    render_live_issues(live_issues)
 
     col_r1, col_r2 = st.columns(2)
     with col_r1:
