@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import threading
 import uuid
 from html import escape
 from datetime import datetime, timedelta
@@ -44,13 +45,28 @@ SOURCE_DEPARTMENTS = [
 ]
 
 PERSIST_PATH = Path(".laporan_situasi_state.json")
-STATE_PREFIX_KEYS = ("mix_", "extra_", "src_", "order_", "tasks_table_", "task_name_", "pic_name_", "pic_role_")
+STATE_PREFIX_KEYS = ("mix_", "extra_", "src_", "order_", "ord_", "tasks_table_", "task_name_", "pic_name_", "pic_role_", "pic_mode_")
 LOCK_TTL_SECONDS = 600
-TEAM_PASSWORDS = {
-    "KUPAS-1": "abcd",
-    "KUPAS-2": "1234",
-    "KUPAS-3": "ab12",
-}
+STATE_IO_LOCK = threading.RLock()
+
+
+def _load_team_passwords() -> dict:
+    raw = os.getenv("TEAM_PASSWORDS", "").strip()
+    if not raw:
+        raise RuntimeError(
+            "TEAM_PASSWORDS environment variable belum diatur. "
+            "Isi dengan JSON mapping team->password sebelum app dijalankan."
+        )
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and parsed:
+            return parsed
+    except Exception:
+        pass
+    raise RuntimeError("TEAM_PASSWORDS tidak valid atau kosong. Gunakan format JSON object.")
+
+
+TEAM_PASSWORDS = _load_team_passwords()
 TEAM_LABELS = {
     "KUPAS-1": "Kupas team Erika",
     "KUPAS-2": "Kupas team Elok",
@@ -117,12 +133,13 @@ def pretty_label(text: str) -> str:
 
 
 def load_persisted_state() -> dict:
-    if not PERSIST_PATH.exists():
-        return {}
-    try:
-        return json.loads(PERSIST_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    with STATE_IO_LOCK:
+        if not PERSIST_PATH.exists():
+            return {}
+        try:
+            return json.loads(PERSIST_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
 
 
 def load_scoped_state(work_date: str, team_id: str) -> dict:
@@ -156,34 +173,41 @@ def save_scoped_state(
     payload: dict,
     expected_version: int | None = None,
 ) -> tuple[bool, int]:
-    raw = load_persisted_state()
-    key = _scope_key(work_date, team_id)
-    scopes = raw.get("scopes")
-    if not isinstance(scopes, dict):
-        scopes = {}
+    with STATE_IO_LOCK:
+        raw = load_persisted_state()
+        key = _scope_key(work_date, team_id)
+        scopes = raw.get("scopes")
+        if not isinstance(scopes, dict):
+            scopes = {}
 
-    existing = scopes.get(key, {})
-    if isinstance(existing, dict) and "data" in existing:
-        current_version = int(existing.get("version", 0))
-        current_lock = existing.get("lock")
-        lock_history = existing.get("lock_history", [])
-    else:
-        current_version = 0
-        current_lock = None
-        lock_history = []
+        existing = scopes.get(key, {})
+        if isinstance(existing, dict) and "data" in existing:
+            current_version = int(existing.get("version", 0))
+            current_lock = existing.get("lock")
+            lock_history = existing.get("lock_history", [])
+        else:
+            current_version = 0
+            current_lock = None
+            lock_history = []
 
-    if expected_version is not None and current_version != expected_version:
-        return False, current_version
+        if expected_version is not None and current_version != expected_version:
+            return False, current_version
 
-    scopes[key] = {
-        "data": payload,
-        "version": current_version + 1,
-        "lock": current_lock,
-        "lock_history": lock_history,
-    }
-    raw["scopes"] = scopes
-    PERSIST_PATH.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-    return True, current_version + 1
+        scopes[key] = {
+            "data": payload,
+            "version": current_version + 1,
+            "lock": current_lock,
+            "lock_history": lock_history,
+        }
+        raw["scopes"] = scopes
+        _write_state_atomically(raw)
+        return True, current_version + 1
+
+
+def _write_state_atomically(raw: dict) -> None:
+    tmp_path = PERSIST_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, PERSIST_PATH)
 
 
 def build_persist_payload() -> dict:
@@ -226,10 +250,11 @@ def persist_state_to_disk() -> None:
     try:
         expected = st.session_state.get("scope_version")
         ok, new_version = save_scoped_state(work_date, team_id, build_persist_payload(), expected_version=expected)
-        if ok:
-            st.session_state["scope_version"] = new_version
-    except Exception:
-        pass
+        st.session_state["scope_version"] = new_version
+        if not ok:
+            return
+    except Exception as e:
+        st.warning("Penyimpanan lokal gagal: " + str(e))
 
 
 def _lock_is_active(lock: dict | None) -> bool:
@@ -250,46 +275,51 @@ def get_scope_lock(work_date: str, team_id: str) -> dict | None:
 
 
 def acquire_scope_lock(work_date: str, team_id: str, operator: str, force: bool = False) -> tuple[bool, str]:
-    raw = load_persisted_state()
-    key = _scope_key(work_date, team_id)
-    scopes = raw.get("scopes")
-    if not isinstance(scopes, dict):
-        scopes = {}
-    rec = get_scope_record(work_date, team_id)
-    lock = rec.get("lock")
-    active = _lock_is_active(lock)
-    token = st.session_state.get("lock_token")
-    if not token:
-        token = str(uuid.uuid4())
-        st.session_state["lock_token"] = token
+    with STATE_IO_LOCK:
+        raw = load_persisted_state()
+        key = _scope_key(work_date, team_id)
+        scopes = raw.get("scopes")
+        if not isinstance(scopes, dict):
+            scopes = {}
+        existing = scopes.get(key, {})
+        if isinstance(existing, dict) and "data" in existing:
+            rec = existing
+        else:
+            rec = {"data": {}, "version": 0, "lock": None, "lock_history": []}
+        lock = rec.get("lock")
+        active = _lock_is_active(lock)
+        token = st.session_state.get("lock_token")
+        if not token:
+            token = str(uuid.uuid4())
+            st.session_state["lock_token"] = token
 
-    if active and not force:
-        same_owner = lock.get("token") == token
-        if not same_owner:
-            return False, f"현재 {lock.get('owner','unknown')} 사용 중"
+        if active and not force:
+            same_owner = lock.get("token") == token
+            if not same_owner:
+                return False, f"Saat ini dipakai oleh {lock.get('owner', 'tidak diketahui')}"
 
-    now = now_iso()
-    new_lock = {
-        "owner": operator,
-        "token": token,
-        "acquired_iso": lock.get("acquired_iso", now) if isinstance(lock, dict) else now,
-        "heartbeat_iso": now,
-    }
-    lock_history = rec.get("lock_history", [])
-    if force:
-        lock_history.append({"action": "takeover", "at": now, "by": operator, "from": (lock or {}).get("owner", "-")})
-    elif not active:
-        lock_history.append({"action": "acquire", "at": now, "by": operator})
+        now = now_iso()
+        new_lock = {
+            "owner": operator,
+            "token": token,
+            "acquired_iso": lock.get("acquired_iso", now) if isinstance(lock, dict) else now,
+            "heartbeat_iso": now,
+        }
+        lock_history = rec.get("lock_history", [])
+        if force:
+            lock_history.append({"action": "takeover", "at": now, "by": operator, "from": (lock or {}).get("owner", "-")})
+        elif not active:
+            lock_history.append({"action": "acquire", "at": now, "by": operator})
 
-    scopes[key] = {
-        "data": rec.get("data", {}),
-        "version": int(rec.get("version", 0)),
-        "lock": new_lock,
-        "lock_history": lock_history,
-    }
-    raw["scopes"] = scopes
-    PERSIST_PATH.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-    return True, "잠금 획득 성공"
+        scopes[key] = {
+            "data": rec.get("data", {}),
+            "version": int(rec.get("version", 0)),
+            "lock": new_lock,
+            "lock_history": lock_history,
+        }
+        raw["scopes"] = scopes
+        _write_state_atomically(raw)
+        return True, "Kunci berhasil diambil"
 
 
 def refresh_scope_lock(work_date: str, team_id: str) -> None:
@@ -380,6 +410,7 @@ def parse_compact_mix(raw: str) -> tuple[dict[str, int], str | None]:
     if not value:
         return counts, None
     # Accept flexible separators: '+', ',', ';', '/', and whitespace.
+    # Require explicit quantity and code, e.g. "1k+2gd".
     matches = list(re.finditer(r"(\d+)\s*([a-zA-Z]+)", value))
     if matches:
         # Validate remaining text only contains separators.
@@ -393,10 +424,6 @@ def parse_compact_mix(raw: str) -> tuple[dict[str, int], str | None]:
             if not key:
                 return counts, f"kode '{key_raw}' tidak dikenal"
             counts[key] += n
-        return counts, None
-    # Backward-compatible fallback: plain number means kupas(k).
-    if value.isdigit():
-        counts["k"] += int(value)
         return counts, None
     return counts, f"format '{value}' tidak valid"
 
@@ -418,13 +445,16 @@ def get_activity_rows(group_items_map: dict[str, list[dict]]) -> tuple[list[dict
                 continue
             prefix = f"{slug(group)}_{item_id}"
             row = {"group": group, "task": task}
-            compact_raw = str(st.session_state.get(f"mix_{prefix}", ""))
+            compact_raw = str(item.get("mix", "")).strip()
+            if not compact_raw:
+                compact_raw = str(st.session_state.get(f"mix_{prefix}", ""))
             counts, parse_error = parse_compact_mix(compact_raw)
             if parse_error:
                 parse_errors.append(f"{group} / {task}: {parse_error}")
             for key in COUNT_KEYS:
                 row[key] = counts[key]
-            if sum(int(row[k]) for k in COUNT_KEYS) > 0:
+            keep_zero_pic_row = item_id == "__pic_report__"
+            if sum(int(row[k]) for k in COUNT_KEYS) > 0 or keep_zero_pic_row:
                 rows.append(row)
     return rows, parse_errors
 
@@ -493,7 +523,7 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
 
     lines: list[str] = [
         f"3-{slot_idx}) {report_time}",
-        f"   Total slot: {slot_item['slot_total']} pax",
+        f"   Total waktu laporan: {slot_item['slot_total']} pax",
         f"   Sumber: {sumber_line}",
     ]
 
@@ -529,11 +559,11 @@ def build_slot_section(slot_item: dict, slot_idx: int) -> list[str]:
 
     event_lines = split_note_lines(slot_item.get("event_slot", ""))
     if event_lines and (event_lines != reason_lines):
-        lines.append(f"   Event slot ini: {event_lines[0]}")
+        lines.append(f"   Keterangan tambahan: {event_lines[0]}")
         for extra in event_lines[1:]:
             lines.append(f"                 - {extra}")
 
-    lines.append(f"   Total semua aktivitas slot ini: {slot_item['slot_total']} pax")
+    lines.append(f"   Total semua aktivitas pada waktu laporan ini: {slot_item['slot_total']} pax")
     return lines
 
 
@@ -570,7 +600,7 @@ def render_activity_summary_table(rows: list[dict]) -> None:
     <table class="activity-summary">
       <thead>
         <tr>
-          <th>Group</th><th>Aktivitas</th><th>Rincian</th><th>Subtotal</th>
+          <th>Blok</th><th>Aktivitas</th><th>Rincian</th><th>Subtotal</th>
         </tr>
       </thead>
       <tbody>
@@ -609,7 +639,7 @@ def validate(payload: dict) -> list[str]:
         ("checker_packing", "Petugas cross cek packing wajib diisi."),
         ("rolling_officer", "Petugas rolling wajib diisi."),
         ("nampan_ubi_officer", "Petugas nampan/ubi wajib diisi."),
-        ("report_slot", "Waktu laporan (slot) wajib dipilih."),
+        ("report_slot", "Waktu laporan wajib dipilih."),
     ]
     for key, msg in required:
         if not str(payload.get(key, "")).strip():
@@ -663,8 +693,8 @@ def _telegram_head_lines(payload: dict) -> list[str]:
         "",
         "*2) Petugas*",
         f"- Pelapor: {pretty_label(payload['reporter'])}",
-        f"- Cross cek kupas: {pretty_label(payload['checker_kupas'])}",
-        f"- Cross cek packing: {pretty_label(payload['checker_packing'])}",
+        f"- Pemeriksa silang kupas: {pretty_label(payload['checker_kupas'])}",
+        f"- Pemeriksa silang packing: {pretty_label(payload['checker_packing'])}",
         f"- Rolling: {pretty_label(payload['rolling_officer'])}",
         f"- Nampan/Ubi: {pretty_label(payload['nampan_ubi_officer'])}",
         "",
@@ -750,7 +780,7 @@ def build_sheet_row(payload: dict, current_total: int) -> list[str]:
 def append_sheet_backup(payload: dict, row: list[str]) -> tuple[str, str]:
     webhook = os.getenv("GOOGLE_SHEETS_WEBHOOK_URL", "").strip()
     if not webhook:
-        return "skip", "Sheets backup 비활성(환경변수 미설정)"
+        return "skip", "Cadangan Sheets nonaktif (variabel lingkungan belum diatur)"
     body = json.dumps(
         {
             "idempotency_key": payload.get("idempotency_key"),
@@ -771,16 +801,16 @@ def append_sheet_backup(payload: dict, row: list[str]) -> tuple[str, str]:
     try:
         with request.urlopen(req, timeout=20) as resp:
             if 200 <= int(getattr(resp, "status", 200)) < 300:
-                return "ok", "Sheets backup OK"
-            return "error", f"Sheets backup HTTP {getattr(resp, 'status', 'unknown')}"
+                return "ok", "Cadangan Sheets berhasil"
+            return "error", f"Cadangan Sheets HTTP {getattr(resp, 'status', 'tidak diketahui')}"
     except Exception as err:
-        return "error", f"Sheets backup 실패: {err}"
+        return "error", f"Cadangan Sheets gagal: {err}"
 
 
 def _telegram_api(method: str, payload: dict) -> tuple[bool, str, dict]:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        return False, "TELEGRAM_BOT_TOKEN 환경변수가 없습니다.", {}
+        return False, "Variabel lingkungan TELEGRAM_BOT_TOKEN belum diatur.", {}
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = parse.urlencode(payload).encode("utf-8")
     req = request.Request(url, data=data, method="POST")
@@ -790,7 +820,7 @@ def _telegram_api(method: str, payload: dict) -> tuple[bool, str, dict]:
             parsed = json.loads(body)
             if parsed.get("ok"):
                 return True, "OK", parsed.get("result", {})
-            return False, f"Telegram 응답 오류: {parsed}", {}
+            return False, f"Galat respons Telegram: {parsed}", {}
     except urlerror.HTTPError as err:
         try:
             body = err.read().decode("utf-8", errors="ignore")
@@ -800,50 +830,56 @@ def _telegram_api(method: str, payload: dict) -> tuple[bool, str, dict]:
         except Exception:
             return False, f"Telegram API HTTP {err.code}", {}
     except Exception as err:
-        return False, f"Telegram API 실패: {err}", {}
+        return False, f"Galat API Telegram: {err}", {}
+
+
+def _escape_mdv2(text: str) -> str:
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 
 def send_new_message(message: str) -> tuple[bool, str, int | None]:
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
-        return False, "TELEGRAM_CHAT_ID 환경변수가 없습니다.", None
+        return False, "Variabel lingkungan TELEGRAM_CHAT_ID belum diatur.", None
+    message = _escape_mdv2(message)
     ok, msg, data = _telegram_api(
         "sendMessage",
-        {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+        {"chat_id": chat_id, "text": message, "parse_mode": "MarkdownV2"},
     )
     if not ok:
         return False, msg, None
-    return True, "Telegram 신규 메시지 전송 성공", data.get("message_id")
+    return True, "Pesan baru Telegram berhasil dikirim", data.get("message_id")
 
 
 def edit_existing_message(message_id: int, message: str) -> tuple[bool, str]:
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
-        return False, "TELEGRAM_CHAT_ID 환경변수가 없습니다."
+        return False, "Variabel lingkungan TELEGRAM_CHAT_ID belum diatur."
+    message = _escape_mdv2(message)
     ok, msg, _ = _telegram_api(
         "editMessageText",
-        {"chat_id": chat_id, "message_id": message_id, "text": message, "parse_mode": "Markdown"},
+        {"chat_id": chat_id, "message_id": message_id, "text": message, "parse_mode": "MarkdownV2"},
     )
     if not ok:
         return False, msg
-    return True, "Telegram 메시지 수정 성공"
+    return True, "Pesan Telegram berhasil diperbarui"
 
 
 def send_update_reply(root_message_id: int) -> tuple[bool, str]:
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
-        return False, "TELEGRAM_CHAT_ID 환경변수가 없습니다."
+        return False, "Variabel lingkungan TELEGRAM_CHAT_ID belum diatur."
     ok, msg, _ = _telegram_api(
         "sendMessage",
         {
             "chat_id": chat_id,
-            "text": "Laporan sudah update.",
+            "text": "Laporan sudah diperbarui.",
             "reply_to_message_id": root_message_id,
         },
     )
     if not ok:
         return False, msg
-    return True, "Update reply 전송 성공"
+    return True, "Balasan pembaruan berhasil dikirim"
 
 
 def sync_scope_if_needed(work_date: str, team_id: str) -> None:
@@ -890,9 +926,28 @@ def main() -> None:
     st.markdown(
         """
         <style>
+        h1 {
+          font-size: 2rem !important;
+          font-weight: 700 !important;
+          line-height: 1.2 !important;
+        }
+        h2, h3 {
+          font-size: 1.35rem !important;
+          font-weight: 650 !important;
+          line-height: 1.25 !important;
+        }
+        div[data-testid="stCaptionContainer"] p {
+          font-size: 1rem !important;
+          color: #4a5568 !important;
+          line-height: 1.45 !important;
+        }
+        .stMarkdown p, label {
+          font-size: 1rem !important;
+          color: #1f2937 !important;
+        }
         .stButton > button {
           padding: 0.15rem 0.5rem;
-          font-size: 0.8rem;
+          font-size: 0.9rem;
           line-height: 1.1;
           white-space: nowrap;
           min-height: 1.9rem;
@@ -934,12 +989,12 @@ def main() -> None:
     lock_info = get_scope_lock(work_date, team_id)
     lock_active = _lock_is_active(lock_info)
     if lock_active:
-        st.caption(f"Lock aktif: {lock_info.get('owner','-')} ({lock_info.get('heartbeat_iso','')})")
-    st.caption("Buka Tim: hari ini pertama kali mulai laporan tim ini (PIN + lock).")
-    st.caption("Take Over Tim: ambil alih saat tim sedang dilock operator lain.")
+        st.caption(f"Kunci aktif: {lock_info.get('owner','-')} ({lock_info.get('heartbeat_iso','')})")
+    st.caption("Buka Tim: pertama kali mulai laporan tim ini hari ini (PIN + kunci).")
+    st.caption("Ambil Alih Tim: ambil alih saat tim sedang dikunci operator lain.")
     lock_c1, lock_c2 = st.columns(2)
     open_clicked = lock_c1.button("Buka Tim")
-    takeover_clicked = lock_c2.button("Take Over Tim", disabled=not lock_active)
+    takeover_clicked = lock_c2.button("Ambil Alih Tim", disabled=not lock_active)
     if open_clicked:
         if not operator_name.strip():
             st.error("Nama operator wajib diisi.")
@@ -950,9 +1005,9 @@ def main() -> None:
                 st.session_state["team_id"] = team_id
                 st.session_state["work_date"] = work_date
                 st.session_state["operator_name"] = operator_name
-                st.success(f"{team_id} 인증 성공")
+                st.success(f"{team_id} berhasil dibuka")
             else:
-                st.error(f"{msg_lock}. 필요하면 Take Over 사용")
+                st.error(f"{msg_lock}. Jika perlu gunakan Ambil Alih Tim")
         else:
             st.error("PIN Tim tidak valid.")
 
@@ -966,14 +1021,14 @@ def main() -> None:
                 st.session_state["team_id"] = team_id
                 st.session_state["work_date"] = work_date
                 st.session_state["operator_name"] = operator_name
-                st.success(f"Take Over 성공: {team_id}")
+                st.success(f"Ambil alih berhasil: {team_id}")
             else:
                 st.error(msg_take)
         else:
-            st.error("PIN Tim tidak valid untuk Take Over.")
+            st.error("PIN Tim tidak valid untuk ambil alih.")
 
     if st.session_state.get("authenticated_scope") != scope:
-        st.warning(f"{team_id} 데이터를 열려면 PIN을 입력 후 'Buka Tim'을 누르세요.")
+        st.warning(f"Untuk membuka data {team_id}, masukkan PIN lalu tekan 'Buka Tim'.")
         st.stop()
 
     sync_scope_if_needed(work_date, team_id)
@@ -1012,7 +1067,7 @@ def main() -> None:
         suggested_slot = slots[0]
     report_slot = suggested_slot
     with col_t3:
-        st.text_input("Slot otomatis (30m)", value=report_slot, disabled=True)
+        st.text_input("Waktu laporan otomatis (30 menit)", value=report_slot, disabled=True)
 
     st.subheader("1) Data Header")
     col_a, col_b = st.columns(2)
@@ -1032,38 +1087,24 @@ def main() -> None:
     with col_r1:
         rolling_officer = st.text_input("Petugas rolling", placeholder="Contoh: Mila", key="rolling_officer")
 
-    with st.expander("Petugas cross check / support", expanded=False):
+    with st.expander("Petugas pemeriksa silang / dukungan", expanded=False):
         col_e, col_f = st.columns(2)
         with col_e:
-            checker_kupas = st.text_input("Cross cek kupas", placeholder="Contoh: Rifka", key="checker_kupas")
+            checker_kupas = st.text_input("Pemeriksa silang kupas", placeholder="Contoh: Rifka", key="checker_kupas")
             nampan_ubi_officer = st.text_input("Petugas nampan / ubi", placeholder="Contoh: Hendra/Hanif", key="nampan_ubi_officer")
         with col_f:
-            checker_packing = st.text_input("Cross cek packing", placeholder="Nama petugas", key="checker_packing")
+            checker_packing = st.text_input("Pemeriksa silang packing", placeholder="Nama petugas", key="checker_packing")
 
     st.subheader("2) Detail Aktivitas + Keterangan")
-    st.caption(f"Slot laporan aktif: {report_slot}")
-    # Reset only when slot actually changes during an active session.
-    # On first load / take over, keep restored values from persisted state.
-    if "_last_slot_form_reset" not in st.session_state:
-        st.session_state["_last_slot_form_reset"] = report_slot
-    elif st.session_state.get("_last_slot_form_reset") != report_slot:
-        st.session_state["current_total_people"] = 0
-        st.session_state["selected_departments"] = []
-        for dep_key, _dep_label in SOURCE_DEPARTMENTS:
-            st.session_state[f"src_{dep_key}"] = 0
-        st.session_state["move_in_raw"] = ""
-        st.session_state["move_out_raw"] = ""
-        st.session_state["change_reason"] = ""
-        st.session_state["tl_confirm"] = ""
-        st.session_state["event_slot"] = ""
-        st.session_state["_last_slot_form_reset"] = report_slot
+    st.caption(f"Waktu laporan aktif: {report_slot}")
+    # Do not auto-reset form values when clock slot changes.
+    # Auto reset caused unexpected "0" totals during edit/resubmit flows.
 
-    current_total_people = st.number_input("Input TL: Total orang per saat ini", min_value=0, step=1, key="current_total_people")
+    current_total_people = st.number_input("Input TL: Total orang saat ini", min_value=0, step=1, key="current_total_people")
     st.caption("Komposisi sumber personel (asal tim yang sedang kerja di slot ini)")
     selected_departments = st.multiselect(
         "Pilih departemen yang aktif di slot ini",
         [label for _, label in SOURCE_DEPARTMENTS],
-        default=st.session_state.get("selected_departments", []),
         key="selected_departments",
     )
     active_department_keys = {k for k, label in SOURCE_DEPARTMENTS if label in selected_departments}
@@ -1116,7 +1157,7 @@ def main() -> None:
 
         with st.expander(f"- {group}", expanded=True):
             st.caption("Flow manual: tambah seperlunya, tanpa default.")
-            pic_c1, pic_c2 = st.columns(2)
+            pic_c1, pic_c2, pic_c3 = st.columns(3)
             with pic_c1:
                 pic_name = st.text_input(
                     "PIC",
@@ -1129,6 +1170,12 @@ def main() -> None:
                     key=f"pic_role_{group_slug}",
                     placeholder="Jabatan PIC",
                 )
+            with pic_c3:
+                pic_mode = st.selectbox(
+                    "Status PIC",
+                    ["Laporan dan kerja", "Laporan tanpa kerja"],
+                    key=f"pic_mode_{group_slug}",
+                )
             group_pic_map[group] = {"name": pic_name, "role": pic_role}
             items = st.session_state[table_key]
             cleaned = []
@@ -1136,7 +1183,17 @@ def main() -> None:
                 if isinstance(item, dict) and item.get("id"):
                     name = str(item.get("tugas", "")).strip()
                     if name and name.lower() not in {"none", "-"}:
-                        cleaned.append({"id": str(item["id"]), "tugas": name})
+                        item_id = str(item["id"])
+                        if item_id == "__pic_report__":
+                            continue
+                        mix_key = f"mix_{group_slug}_{item_id}"
+                        mix_value = str(st.session_state.get(mix_key, item.get("mix", ""))).strip()
+                        cleaned.append({"id": item_id, "tugas": name, "mix": mix_value})
+            pic_task_name = "PIC LAPORAN TANPA KERJA" if pic_mode == "Laporan tanpa kerja" else "PIC LAPORAN DAN KERJA"
+            # Keep this row locked for name/order/delete, but allow manual count input.
+            pic_mix_key = f"mix_{group_slug}___pic_report__"
+            pic_mix_value = str(st.session_state.get(pic_mix_key, "")).strip()
+            cleaned.insert(0, {"id": "__pic_report__", "tugas": pic_task_name, "mix": pic_mix_value})
             st.session_state[table_key] = cleaned
             items = cleaned
 
@@ -1162,35 +1219,45 @@ def main() -> None:
 
             for idx, item in enumerate(items):
                 task_id = item["id"]
-                row_no, row_task, row_mix, row_del = st.columns([0.8, 1.8, 6.0, 1.4])
+                row_no_display = "0" if task_id == "__pic_report__" else str(max(1, idx))
+                row_no, row_task, row_mix, row_del = st.columns([0.7, 4.8, 3.5, 1.2])
                 with row_no:
                     ord_key = f"ord_{group_slug}_{task_id}"
                     if ord_key not in st.session_state:
-                        st.session_state[ord_key] = str(idx + 1)
+                        st.session_state[ord_key] = row_no_display
                     st.text_input(
                         "No",
                         key=ord_key,
                         label_visibility="collapsed",
+                        disabled=(task_id == "__pic_report__"),
                     )
                 with row_task:
                     task_name_key = f"task_name_{group_slug}_{task_id}"
-                    if task_name_key not in st.session_state:
+                    if task_id == "__pic_report__":
+                        st.session_state[task_name_key] = pic_task_name
+                    elif task_name_key not in st.session_state:
                         st.session_state[task_name_key] = item["tugas"]
                     edited_name = st.text_input(
-                        f"Nama tugas {idx + 1}",
+                        f"Nama tugas {row_no_display}",
                         key=task_name_key,
                         label_visibility="collapsed",
+                        disabled=(task_id == "__pic_report__"),
                     ).strip()
-                    item["tugas"] = edited_name
+                    item["tugas"] = pic_task_name if task_id == "__pic_report__" else edited_name
                 with row_mix:
-                    st.text_input(
-                        f"Rincian {idx + 1}",
-                        key=f"mix_{group_slug}_{task_id}",
-                        placeholder="contoh: 3k+2gd",
+                    mix_key = f"mix_{group_slug}_{task_id}"
+                    if mix_key not in st.session_state and str(item.get("mix", "")).strip():
+                        st.session_state[mix_key] = str(item.get("mix", "")).strip()
+                    mix_value = st.text_input(
+                        f"Rincian {row_no_display}",
+                        key=mix_key,
+                        placeholder=("contoh: 1k / 1pk / 2gd" if task_id == "__pic_report__" else "contoh: 3k+2gd"),
                         label_visibility="collapsed",
+                        disabled=False,
                     )
+                    item["mix"] = str(mix_value).strip()
                 with row_del:
-                    if st.button("Hapus", key=f"del_{group_slug}_{task_id}", type="secondary"):
+                    if task_id != "__pic_report__" and st.button("Hapus", key=f"del_{group_slug}_{task_id}", type="secondary"):
                         st.session_state["confirm_remove_task"] = f"{group_slug}:{task_id}"
                 if st.session_state.get("confirm_remove_task") == f"{group_slug}:{task_id}":
                     st.warning("Hapus baris tugas ini?")
@@ -1218,14 +1285,17 @@ def main() -> None:
                     for i, it in enumerate(items):
                         raw = str(st.session_state.get(f"ord_{group_slug}_{it['id']}", i + 1)).strip()
                         wanted = int(raw) if raw.isdigit() else (i + 1)
-                        wanted = max(1, min(wanted, max(1, total_len)))
+                        wanted = max(0, min(wanted, max(1, total_len)))
                         ranked.append((wanted, i, it))
                     ranked.sort(key=lambda x: (x[0], x[1]))
+                    ranked = sorted(ranked, key=lambda x: (0 if x[2]["id"] == "__pic_report__" else 1, x[0], x[1]))
                     st.session_state[table_key] = [x[2] for x in ranked]
                     st.rerun()
             block_total = 0
             for it in items:
-                mix_raw = str(st.session_state.get(f"mix_{group_slug}_{it['id']}", "")).strip()
+                mix_raw = str(it.get("mix", "")).strip()
+                if not mix_raw:
+                    mix_raw = str(st.session_state.get(f"mix_{group_slug}_{it['id']}", "")).strip()
                 counts, _err = parse_compact_mix(mix_raw)
                 block_total += sum(counts.values())
             st.caption(f"Subtotal blok '{group}': {block_total} pax")
@@ -1247,23 +1317,49 @@ def main() -> None:
                         st.rerun()
 
             group_items_map[group] = items
+            st.session_state[table_key] = items
+
+    if selected_groups:
+        all_sort_c1, _all_sort_c2 = st.columns([2, 10])
+        with all_sort_c1:
+            if st.button("Urut semua blok", type="secondary"):
+                for group in selected_groups:
+                    group_slug = slug(group)
+                    table_key = f"tasks_table_{group_slug}"
+                    items = st.session_state.get(table_key, [])
+                    if not isinstance(items, list) or not items:
+                        continue
+                    ranked = []
+                    total_len = len(items)
+                    for i, it in enumerate(items):
+                        task_id = str(it.get("id", ""))
+                        raw = str(st.session_state.get(f"ord_{group_slug}_{task_id}", i + 1)).strip()
+                        wanted = int(raw) if raw.isdigit() else (i + 1)
+                        if task_id == "__pic_report__":
+                            wanted = 0
+                        else:
+                            wanted = max(1, min(wanted, max(1, total_len)))
+                        ranked.append((wanted, i, it))
+                    ranked.sort(key=lambda x: (0 if str(x[2].get("id", "")) == "__pic_report__" else 1, x[0], x[1]))
+                    st.session_state[table_key] = [x[2] for x in ranked]
+                st.rerun()
 
     activity_rows, parse_errors = get_activity_rows(group_items_map)
     current_total = activity_total(activity_rows)
     prev = st.session_state.previous_total
-    delta_text = "N/A" if prev is None else f"{current_total - prev:+d}"
-    st.info(f"Total sekarang: {current_total} pax | Delta vs sebelumnya: {delta_text}")
+    delta_text = "Belum ada" if prev is None else f"{current_total - prev:+d}"
+    st.info(f"Total sekarang: {current_total} pax | Selisih dari sebelumnya: {delta_text}")
     if isinstance(prev, int):
-        st.caption(f"Pembanding otomatis: total slot sebelumnya di draft tim ini = {prev} pax")
+        st.caption(f"Pembanding otomatis: total waktu laporan sebelumnya pada draf tim ini = {prev} pax")
     if st.session_state.slot_history:
         same_slot_prev = next((x for x in st.session_state.slot_history if x.get("slot") == report_slot), None)
         if same_slot_prev:
             prev_sig = json.dumps(same_slot_prev.get("activities", []), ensure_ascii=False, sort_keys=True)
             now_sig = json.dumps(activity_rows, ensure_ascii=False, sort_keys=True)
             if prev_sig != now_sig:
-                st.warning("Perubahan terdeteksi: data slot ini berbeda dari versi sebelumnya.")
+                st.warning("Perubahan terdeteksi: data waktu laporan ini berbeda dari versi sebelumnya.")
     if isinstance(prev, int) and current_total != prev:
-        st.error("ALARM: total slot berbeda dengan laporan sebelumnya. Wajib cek penyebab.")
+        st.error("PERINGATAN: total waktu laporan berbeda dengan laporan sebelumnya. Wajib cek penyebab.")
 
     if activity_rows:
         render_activity_summary_table(activity_rows)
@@ -1289,13 +1385,13 @@ def main() -> None:
     if source_sum_now != int(current_total_people):
         st.error("Total komposisi sumber tidak sama dengan Total orang per saat ini.")
 
-    st.markdown("**Analisa Perubahan Total (untuk TL)**")
-    prev_text = "N/A" if prev is None else f"{prev} pax"
-    st.caption(f"Total slot sebelumnya: {prev_text} | Delta sekarang: {delta_text}")
+    st.markdown("**Analisis Perubahan Total (untuk TL)**")
+    prev_text = "Belum ada" if prev is None else f"{prev} pax"
+    st.caption(f"Total waktu laporan sebelumnya: {prev_text} | Selisih sekarang: {delta_text}")
     if isinstance(prev, int) and current_total != prev:
-        st.error(f"ALARM: total berubah dari {prev} ke {current_total} (delta {current_total - prev:+d}).")
-    move_in_raw = st.text_input("Mutasi masuk (opsional, contoh: 2gd+1k)", placeholder="contoh: 2gd")
-    move_out_raw = st.text_input("Mutasi keluar (opsional, contoh: 2gd)", placeholder="contoh: 2gd")
+        st.error(f"PERINGATAN: total berubah dari {prev} ke {current_total} (selisih {current_total - prev:+d}).")
+    move_in_raw = st.text_input("Mutasi masuk (opsional, contoh: 2gd+1k)", placeholder="contoh: 2gd", key="move_in_raw")
+    move_out_raw = st.text_input("Mutasi keluar (opsional, contoh: 2gd)", placeholder="contoh: 2gd", key="move_out_raw")
     move_in_counts, move_in_err = parse_compact_mix(move_in_raw)
     move_out_counts, move_out_err = parse_compact_mix(move_out_raw)
     move_in_total = sum(move_in_counts.values())
@@ -1326,10 +1422,11 @@ def main() -> None:
             key="tl_confirm",
         )
 
+    st.markdown("**Keterangan**")
     event_slot = st.text_area(
-        "Event slot ini (opsional)",
-        height=80,
-        placeholder="Contoh: 1 orang izin pulang sebentar: Mike / Shift tengah datang 3 pax.",
+        "Keterangan tambahan (opsional)",
+        height=120,
+        placeholder="Contoh: Listrik padam, kerja berhenti sementara.",
         key="event_slot",
     )
 
@@ -1380,20 +1477,20 @@ def main() -> None:
     preview_parts = build_telegram_parts(payload, preview_history, TELEGRAM_SOFT_LIMIT)
     active_part = preview_parts[-1]
 
-    st.subheader("Preview (Telegram message)")
+    st.subheader("Pratinjau (pesan Telegram)")
     preview_text = active_part["text"]
     st.code(preview_text, language="text")
     if len(preview_parts) > 1:
         st.warning(
-            f"Panjang pesan melebihi batas. Akan lanjut otomatis ke part {active_part['part_no']} "
-            f"(slot mulai {format_time_only(active_part['history'][0].get('report_time', active_part['history'][0].get('slot', '-')))})."
+            f"Panjang pesan melebihi batas. Akan lanjut otomatis ke bagian {active_part['part_no']} "
+            f"(mulai waktu {format_time_only(active_part['history'][0].get('report_time', active_part['history'][0].get('slot', '-')))})."
         )
 
     root_id = st.session_state.telegram_root_message_id
     if root_id:
-        st.caption(f"Mode: Update pesan existing (message_id={root_id})")
+        st.caption(f"Cara kirim: perbarui pesan yang sudah ada (ID pesan={root_id})")
     else:
-        st.caption("Mode: Kirim pesan baru (pertama kali)")
+        st.caption("Cara kirim: kirim pesan baru (pertama kali)")
 
     if st.button("Mulai siklus laporan baru"):
         st.session_state["confirm_new_cycle"] = True
@@ -1407,96 +1504,104 @@ def main() -> None:
                 st.session_state.slot_history = []
                 st.session_state["confirm_new_cycle"] = False
                 persist_state_to_disk()
-                st.success("Siklus baru dimulai. Submit berikutnya akan kirim pesan baru.")
+                st.success("Siklus baru dimulai. Pengiriman berikutnya akan mengirim pesan baru.")
                 st.rerun()
         with nx2:
             if st.button("Batal reset", type="secondary"):
                 st.session_state["confirm_new_cycle"] = False
                 st.rerun()
 
-    submitted = st.button("Kirim Telegram")
+    submitted = st.button("Kirim ke Telegram")
     if submitted:
-        current_rec = get_scope_record(work_date, team_id)
-        live_version = int(current_rec.get("version", 0))
-        live_lock = current_rec.get("lock")
-        if not isinstance(live_lock, dict) or live_lock.get("token") != st.session_state.get("lock_token"):
-            st.error("잠금 소유권이 없습니다. 다시 Buka Tim 또는 Take Over 후 시도하세요.")
+        if st.session_state.get("_submitting"):
+            st.warning("Sedang diproses. Mohon tunggu sebentar.")
             return
-        # If lock token is ours, accept latest live version to avoid false conflict blocks.
-        session_ver = st.session_state.get("scope_version")
-        if session_ver is not None and live_version != int(session_ver):
-            st.session_state["scope_version"] = live_version
-
-        errors = validate(payload)
-        if errors:
-            st.error(errors[0])
-            return
-
-        st.session_state.submission_id = payload["idempotency_key"]
-        st.session_state.previous_total = current_total
-        st.session_state.slot_history = active_part["history"]
-        persist_state_to_disk()
-
-        root_message_id = st.session_state.telegram_root_message_id
-        if root_message_id and len(preview_parts) == 1:
-            ok, msg = edit_existing_message(root_message_id, preview_text)
-            if not ok:
-                m = msg.lower()
-                if "message is not modified" in m:
-                    st.info("Konten sama dengan pesan sebelumnya. Tidak ada edit baru.")
-                elif ("message to edit not found" in m) or ("can't be edited" in m) or ("message can't be edited" in m):
-                    # Fallback: if edit target is gone/uneditable, send as a new message and relink root.
-                    ok_new, msg_new, message_id_new = send_new_message(preview_text)
-                    if not ok_new:
+        st.session_state["_submitting"] = True
+        try:
+            current_rec = get_scope_record(work_date, team_id)
+            live_version = int(current_rec.get("version", 0))
+            live_lock = current_rec.get("lock")
+            if not isinstance(live_lock, dict) or live_lock.get("token") != st.session_state.get("lock_token"):
+                st.error("Anda tidak memegang kunci. Buka Tim atau Ambil Alih Tim lalu coba lagi.")
+                return
+            # If lock token is ours, accept latest live version to avoid false conflict blocks.
+            session_ver = st.session_state.get("scope_version")
+            if session_ver is not None and live_version != int(session_ver):
+                st.session_state["scope_version"] = live_version
+    
+            errors = validate(payload)
+            if errors:
+                st.error(errors[0])
+                return
+    
+            st.session_state.submission_id = payload["idempotency_key"]
+            st.session_state.previous_total = current_total
+            st.session_state.slot_history = active_part["history"]
+            persist_state_to_disk()
+    
+            root_message_id = st.session_state.telegram_root_message_id
+            if root_message_id and len(preview_parts) == 1:
+                ok, msg = edit_existing_message(root_message_id, preview_text)
+                if not ok:
+                    m = msg.lower()
+                    if "message is not modified" in m:
+                        st.info("Isi sama dengan pesan sebelumnya. Tidak ada perubahan baru.")
+                    elif ("message to edit not found" in m) or ("can't be edited" in m) or ("message can't be edited" in m):
+                        # Fallback: if edit target is gone/uneditable, send as a new message and relink root.
+                        ok_new, msg_new, message_id_new = send_new_message(preview_text)
+                        if not ok_new:
+                            st.error(msg)
+                            return
+                        st.session_state.telegram_root_message_id = message_id_new
+                        st.warning("Pesan lama tidak bisa diperbarui. Dikirim sebagai pesan baru.")
+                        st.success(f"{msg_new} (ID pesan={message_id_new})")
+                        persist_state_to_disk()
+                        row = build_sheet_row(payload, current_total)
+                        sheet_state, msg_sheet = append_sheet_backup(payload, row)
+                        if sheet_state == "ok":
+                            st.caption("Cadangan Sheets: berhasil")
+                        elif sheet_state == "error":
+                            st.warning(msg_sheet)
+                        else:
+                            st.caption(msg_sheet)
+                        st.caption(f"Kunci idempoten: {payload['idempotency_key']}")
+                        return
+                    else:
                         st.error(msg)
                         return
-                    st.session_state.telegram_root_message_id = message_id_new
-                    st.warning("Pesan lama tidak bisa di-edit. Dikirim sebagai pesan baru.")
-                    st.success(f"{msg_new} (message_id={message_id_new})")
-                    persist_state_to_disk()
-                    row = build_sheet_row(payload, current_total)
-                    sheet_state, msg_sheet = append_sheet_backup(payload, row)
-                    if sheet_state == "ok":
-                        st.caption("Sheets backup: OK")
-                    elif sheet_state == "error":
-                        st.warning(msg_sheet)
-                    else:
-                        st.caption(msg_sheet)
-                    st.caption(f"Idempotency Key: {payload['idempotency_key']}")
-                    return
-                else:
+                ok_reply, msg_reply = send_update_reply(root_message_id)
+                if not ok_reply:
+                    st.warning(f"Pesan berhasil diperbarui, tetapi balasan gagal: {msg_reply}")
+                st.success("Pesan Telegram berhasil diperbarui dan balasan pembaruan sudah diproses")
+            else:
+                ok, msg, message_id = send_new_message(preview_text)
+                if not ok:
                     st.error(msg)
                     return
-            ok_reply, msg_reply = send_update_reply(root_message_id)
-            if not ok_reply:
-                st.warning(f"Pesan terupdate, tapi reply gagal: {msg_reply}")
-            st.success("Telegram 메시지 수정 완료 + update reply 처리")
-        else:
-            ok, msg, message_id = send_new_message(preview_text)
-            if not ok:
-                st.error(msg)
-                return
-            st.session_state.telegram_root_message_id = message_id
-            if root_message_id and len(preview_parts) > 1:
-                st.warning(
-                    "Batas panjang tercapai. Laporan dilanjutkan sebagai pesan baru "
-                    f"(part {active_part['part_no']})."
-                )
-            st.success(f"{msg} (message_id={message_id})")
+                st.session_state.telegram_root_message_id = message_id
+                if root_message_id and len(preview_parts) > 1:
+                    st.warning(
+                        "Batas panjang tercapai. Laporan dilanjutkan sebagai pesan baru "
+                        f"(bagian {active_part['part_no']})."
+                    )
+                st.success(f"{msg} (ID pesan={message_id})")
+    
+            row = build_sheet_row(payload, current_total)
+            sheet_state, msg_sheet = append_sheet_backup(payload, row)
+            if sheet_state == "ok":
+                st.caption("Cadangan Sheets: berhasil")
+            elif sheet_state == "error":
+                st.warning(msg_sheet)
+            else:
+                st.caption(msg_sheet)
+            st.caption(f"Kunci idempoten: {payload['idempotency_key']}")
+    
+        finally:
+            st.session_state["_submitting"] = False
 
-        row = build_sheet_row(payload, current_total)
-        sheet_state, msg_sheet = append_sheet_backup(payload, row)
-        if sheet_state == "ok":
-            st.caption("Sheets backup: OK")
-        elif sheet_state == "error":
-            st.warning(msg_sheet)
-        else:
-            st.caption(msg_sheet)
-        st.caption(f"Idempotency Key: {payload['idempotency_key']}")
-
-    if st.button("Simpan draft lokal"):
+    if st.button("Simpan draf lokal"):
         persist_state_to_disk()
-        st.success("Draft lokal tersimpan.")
+        st.success("Draf lokal tersimpan.")
 
     # Persist latest inputs on each rerun so reopen continues from last state.
     persist_state_to_disk()
@@ -1504,3 +1609,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
