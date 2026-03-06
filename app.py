@@ -1078,15 +1078,18 @@ def edit_existing_message(message_id: int, message: str) -> tuple[bool, str]:
     return True, "Pesan Telegram berhasil diperbarui"
 
 
-def send_update_reply(root_message_id: int) -> tuple[bool, str]:
+def send_update_reply(root_message_id: int, part_no: int | None = None) -> tuple[bool, str]:
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
         return False, "Variabel lingkungan TELEGRAM_CHAT_ID belum diatur."
+    update_text = "Laporan sudah diperbarui."
+    if isinstance(part_no, int) and part_no > 0:
+        update_text = f"Laporan sudah diperbarui (part {part_no})."
     ok, msg, _ = _telegram_api(
         "sendMessage",
         {
             "chat_id": chat_id,
-            "text": "Laporan sudah diperbarui.",
+            "text": update_text,
             "reply_to_message_id": root_message_id,
         },
     )
@@ -1852,6 +1855,7 @@ def main() -> None:
     
             root_message_id = st.session_state.telegram_root_message_id
             if root_message_id and len(preview_parts) == 1:
+                reply_target_message_id = root_message_id
                 ok, msg = edit_existing_message(root_message_id, preview_text)
                 if not ok:
                     m = msg.lower()
@@ -1864,12 +1868,13 @@ def main() -> None:
                             st.error(msg)
                             return
                         st.session_state.telegram_root_message_id = message_id_new
+                        reply_target_message_id = message_id_new
                         st.warning("Pesan lama tidak bisa diperbarui. Dikirim sebagai pesan baru.")
                         st.success(f"{msg_new} (ID pesan={message_id_new})")
                     else:
                         st.error(msg)
                         return
-                ok_reply, msg_reply = send_update_reply(root_message_id)
+                ok_reply, msg_reply = send_update_reply(reply_target_message_id, active_part["part_no"])
                 if not ok_reply:
                     st.warning(f"Pesan berhasil diperbarui, tetapi balasan gagal: {msg_reply}")
                 st.success("Pesan Telegram berhasil diperbarui dan balasan pembaruan sudah diproses")
@@ -1884,6 +1889,9 @@ def main() -> None:
                         "Batas panjang tercapai. Laporan dilanjutkan sebagai pesan baru "
                         f"(bagian {active_part['part_no']})."
                     )
+                    ok_reply, msg_reply = send_update_reply(message_id, active_part["part_no"])
+                    if not ok_reply:
+                        st.warning(f"Pesan baru berhasil dikirim, tetapi balasan pembaruan gagal: {msg_reply}")
                 st.success(f"{msg} (ID pesan={message_id})")
 
             st.session_state.submission_id = payload["idempotency_key"]
